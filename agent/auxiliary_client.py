@@ -1380,6 +1380,69 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
     return api_key, base_url
 
 
+def _resolve_minimax_oauth_aux(
+    model: Optional[str],
+    async_mode: bool = False,
+) -> Optional[Tuple[Any, Optional[str]]]:
+    """Build an AnthropicAuxiliaryClient for a MiniMax OAuth-authenticated session.
+
+    MiniMax OAuth tokens are valid only against the Anthropic Messages-compatible
+    endpoint (``/anthropic/v1/messages``). This mirrors the main runtime path
+    which also forces ``api_mode=anthropic_messages`` for minimax-oauth.
+
+    Returns ``(client, model)`` or ``None`` if the user is not authenticated.
+    """
+    try:
+        from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+
+        creds = resolve_minimax_oauth_runtime_credentials()
+    except Exception as exc:
+        logger.debug(
+            "Auxiliary minimax-oauth credential resolution failed: %s", exc)
+        return None
+
+    api_key = str(creds.get("api_key") or "").strip()
+    raw_base_url = str(creds.get("base_url") or "").strip().rstrip("/")
+    # MiniMax OAuth uses the Anthropic SDK which appends /v1/messages to the
+    # base URL. The OAuth base URL is already the /anthropic surface
+    # (e.g. https://api.minimax.io/anthropic), so we pass it through untouched.
+    # DO NOT call _to_openai_base_url here — that helper strips /anthropic and
+    # appends /v1, which produces https://api.minimax.io/v1 + SDK's /v1/messages
+    # = https://api.minimax.io/v1/v1/messages → 404.
+    base_url = raw_base_url
+
+    if not api_key:
+        logger.debug("Auxiliary minimax-oauth: no access token available")
+        return None
+
+    # MiniMax OAuth requires anthropic_messages API mode
+    final_model = _normalize_resolved_model(
+        model or _read_main_model(), "minimax-oauth")
+    if not final_model:
+        final_model = "MiniMax-M3"
+
+    try:
+        from agent.anthropic_adapter import build_anthropic_client
+        real_client = build_anthropic_client(api_key, base_url)
+    except ImportError:
+        logger.warning(
+            "Auxiliary minimax-oauth: anthropic SDK not installed — "
+            "vision/compression/title tasks will not work with MiniMax OAuth. "
+            "Install it or use a different provider."
+        )
+        return None
+
+    sync_client = AnthropicAuxiliaryClient(
+        real_client, final_model, api_key, base_url, is_oauth=True,
+    )
+    logger.debug(
+        "Auxiliary client: MiniMax OAuth (%s via Anthropic Messages)", final_model)
+    return (
+        (_to_async_client(sync_client, final_model, is_vision=True) if async_mode
+         else (sync_client, final_model))
+    )
+
+
 def _read_codex_access_token() -> Optional[str]:
     """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
 
@@ -3967,7 +4030,7 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
-    elif pconfig.auth_type in {"oauth_device_code", "oauth_external"}:
+    elif pconfig.auth_type in {"oauth_device_code", "oauth_external", "oauth_minimax"}:
         # OAuth providers — route through their specific try functions
         if provider == "nous":
             return resolve_provider_client("nous", model, async_mode)
@@ -3975,6 +4038,11 @@ def resolve_provider_client(
             return resolve_provider_client("openai-codex", model, async_mode)
         if provider == "xai-oauth":
             return resolve_provider_client("xai-oauth", model, async_mode)
+        if provider == "minimax-oauth":
+            creds = _resolve_minimax_oauth_aux(model, async_mode)
+            if creds is not None:
+                return creds
+            return None, None
         # Other OAuth providers not directly supported
         logger.warning("resolve_provider_client: OAuth provider %s not "
                        "directly supported, try 'auto'", provider)
